@@ -1,0 +1,52 @@
+.venv
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Environment
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Output & results
+output/
+analysis/
+models/
+visualizations/
+*.parquet
+*.pkl
+*.csv
+*.json
+
+# Logs
+*.log
+
+# Pip
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Test and coverage
+.cache/
+*.cover
+coverage.*
+
+# Misc
+*.bak
+*.tmp
+

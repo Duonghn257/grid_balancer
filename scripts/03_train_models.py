@@ -100,11 +100,51 @@ y = df_train[features_info['target']].copy()
 # Encode categorical features
 label_encoders = {}
 for col in categorical_features:
+    if col not in X.columns:
+        print(f"⚠️  Warning: Column '{col}' not found in X, skipping...")
+        continue
+    
+    # Đảm bảo lấy Series 1D, không phải DataFrame
+    col_data = X[col]
+    if isinstance(col_data, pd.DataFrame):
+        # Nếu là DataFrame (có duplicate column names), lấy cột đầu tiên
+        col_data = col_data.iloc[:, 0]
+        print(f"⚠️  Warning: Column '{col}' is a DataFrame, using first column")
+    
+    # Convert to Series nếu chưa phải
+    if not isinstance(col_data, pd.Series):
+        col_data = pd.Series(col_data)
+    
     le = LabelEncoder()
-    X[col] = le.fit_transform(X[col].astype(str))
+    X[col] = le.fit_transform(col_data.astype(str))
     label_encoders[col] = le
 
-print(f"✅ Đã encode categorical features")
+print(f"✅ Đã encode {len(label_encoders)} categorical features")
+
+# Loại bỏ duplicate columns (nếu có)
+print("\n📊 Kiểm tra và loại bỏ duplicate columns...")
+if X.columns.duplicated().any():
+    duplicate_cols = X.columns[X.columns.duplicated()].tolist()
+    print(f"⚠️  Phát hiện duplicate columns: {duplicate_cols}")
+    # Giữ lại cột đầu tiên, loại bỏ các cột duplicate
+    X = X.loc[:, ~X.columns.duplicated()]
+    print(f"✅ Đã loại bỏ duplicate columns. Shape mới: {X.shape}")
+
+# Đảm bảo tất cả các cột đều là Series 1D
+print("\n📊 Đảm bảo tất cả cột đều là Series 1D...")
+for col in X.columns:
+    col_data = X[col]
+    if isinstance(col_data, pd.DataFrame):
+        # Nếu là DataFrame, lấy cột đầu tiên
+        X[col] = col_data.iloc[:, 0]
+        print(f"⚠️  Đã sửa cột '{col}' từ DataFrame thành Series")
+    elif not isinstance(col_data, pd.Series):
+        # Nếu không phải Series, convert
+        X[col] = pd.Series(col_data, index=X.index)
+        print(f"⚠️  Đã convert cột '{col}' thành Series")
+
+print(f"✅ X shape cuối cùng: {X.shape}")
+print(f"✅ Tất cả cột đều là Series 1D")
 
 # ============================================================================
 # 3. CHIA TRAIN/TEST SET (THEO THỜI GIAN)

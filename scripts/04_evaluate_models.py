@@ -62,7 +62,7 @@ print("=" * 80)
 
 # Sử dụng cùng subset buildings như khi training
 np.random.seed(42)
-sample_size = min(200, df['building_id'].nunique())
+sample_size = min(10, df['building_id'].nunique())
 sample_buildings = np.random.choice(
     df['building_id'].unique(), 
     size=sample_size, 
@@ -87,15 +87,47 @@ categorical_features = [f for f in features_info['categorical_features'] if f in
 X_test = df_test_only[all_features + categorical_features].copy()
 y_test = df_test_only[features_info['target']].copy()
 
+# Loại bỏ duplicate columns (nếu có)
+if X_test.columns.duplicated().any():
+    duplicate_cols = X_test.columns[X_test.columns.duplicated()].tolist()
+    print(f"⚠️  Phát hiện duplicate columns: {duplicate_cols}")
+    X_test = X_test.loc[:, ~X_test.columns.duplicated()]
+    print(f"✅ Đã loại bỏ duplicate columns. Shape mới: {X_test.shape}")
+
+# Đảm bảo tất cả các cột đều là Series 1D
+for col in X_test.columns:
+    col_data = X_test[col]
+    if isinstance(col_data, pd.DataFrame):
+        # Nếu là DataFrame, lấy cột đầu tiên
+        X_test[col] = col_data.iloc[:, 0]
+        print(f"⚠️  Đã sửa cột '{col}' từ DataFrame thành Series")
+
 # Encode categorical
 for col in categorical_features:
+    if col not in X_test.columns:
+        continue
     if col in label_encoders:
         le = label_encoders[col]
-        X_test[col] = X_test[col].astype(str)
-        X_test[col] = X_test[col].apply(
-            lambda x: x if x in le.classes_ else le.classes_[0]
-        )
-        X_test[col] = le.transform(X_test[col])
+        # Đảm bảo là Series 1D
+        col_data = X_test[col]
+        if isinstance(col_data, pd.DataFrame):
+            col_data = col_data.iloc[:, 0]
+        elif not isinstance(col_data, pd.Series):
+            col_data = pd.Series(col_data, index=X_test.index)
+        
+        # Convert to string
+        col_data = col_data.astype(str)
+        
+        # Xử lý các giá trị chưa thấy (unknown values)
+        mask = ~col_data.isin(le.classes_)
+        # Tính số lượng unknown values (đảm bảo là scalar)
+        unknown_count = np.sum(mask.values) if isinstance(mask, pd.Series) else np.sum(mask)
+        if unknown_count > 0:
+            # Thay thế các giá trị unknown bằng giá trị đầu tiên trong classes
+            col_data.loc[mask] = le.classes_[0]
+        
+        # Transform
+        X_test[col] = le.transform(col_data)
 
 print(f"✅ Test set: {X_test.shape[0]} samples")
 
@@ -165,7 +197,11 @@ for idx, (model_name, y_pred) in enumerate(predictions.items()):
     sample_size = min(5000, len(y_test))
     sample_idx = np.random.choice(len(y_test), sample_size, replace=False)
     
-    ax.scatter(y_test.iloc[sample_idx], y_pred[sample_idx], alpha=0.3, s=10)
+    # Convert to numpy arrays để tránh lỗi indexing
+    y_test_array = np.array(y_test)
+    y_pred_array = np.array(y_pred)
+    
+    ax.scatter(y_test_array[sample_idx], y_pred_array[sample_idx], alpha=0.3, s=10)
     
     # Đường perfect prediction
     min_val = min(y_test.min(), y_pred.min())
@@ -266,7 +302,11 @@ for idx, (model_name, y_pred) in enumerate(predictions.items()):
     sample_size = min(5000, len(residuals))
     sample_idx = np.random.choice(len(residuals), sample_size, replace=False)
     
-    ax.scatter(y_pred[sample_idx], residuals[sample_idx], alpha=0.3, s=10)
+    # Convert to numpy arrays để tránh lỗi indexing
+    y_pred_array = np.array(y_pred)
+    residuals_array = np.array(residuals)
+    
+    ax.scatter(y_pred_array[sample_idx], residuals_array[sample_idx], alpha=0.3, s=10)
     ax.axhline(y=0, color='r', linestyle='--', linewidth=2)
     ax.set_xlabel('Predicted Values', fontsize=12)
     ax.set_ylabel('Residuals', fontsize=12)

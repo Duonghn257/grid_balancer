@@ -240,13 +240,17 @@ class ElectricityConsumptionInference:
         Returns:
             Dictionary of lag features
         """
+        # BỎ electricity_lag1 để model học mối quan hệ nhân quả tốt hơn
+        # CHỈ GIỮ electricity_lag24 (thói quen sử dụng) và rolling means
         lag_features = {
-            'electricity_lag1': 0.0,
             'electricity_lag24': 0.0,
-            'electricity_lag168': 0.0,
-            'electricity_rolling_mean_24h': 0.0,
-            'electricity_rolling_std_24h': 0.0,
-            'electricity_rolling_mean_7d': 0.0
+            'electricity_rolling_mean_4h': 0.0,
+            'electricity_rolling_mean_24h': 0.0
+            # Bỏ các lag features khác:
+            # 'electricity_lag168': 0.0,
+            # 'electricity_rolling_mean_24h': 0.0,
+            # 'electricity_rolling_std_24h': 0.0,
+            # 'electricity_rolling_mean_7d': 0.0
         }
         
         if self._historical_data is None:
@@ -266,42 +270,27 @@ class ElectricityConsumptionInference:
             if len(building_data) == 0:
                 return lag_features
             
-            # Get lag values
+            # Get lag values - CHỈ TÍNH electricity_lag24 và rolling means (BỎ lag1)
             current_idx = building_data[building_data['timestamp'] <= timestamp]
             if len(current_idx) > 0:
-                # Lag 1 hour
-                if len(current_idx) > 1:
-                    lag_features['electricity_lag1'] = current_idx.iloc[-2]['electricity_consumption'] if 'electricity_consumption' in current_idx.columns else 0.0
-                
-                # Lag 24 hours
+                # Lag 24 hours (cùng giờ ngày hôm trước)
                 target_time = timestamp - timedelta(hours=24)
                 lag24_data = building_data[building_data['timestamp'] <= target_time]
                 if len(lag24_data) > 0:
                     lag_features['electricity_lag24'] = lag24_data.iloc[-1]['electricity_consumption'] if 'electricity_consumption' in lag24_data.columns else 0.0
                 
-                # Lag 168 hours (1 week)
-                target_time = timestamp - timedelta(hours=168)
-                lag168_data = building_data[building_data['timestamp'] <= target_time]
-                if len(lag168_data) > 0:
-                    lag_features['electricity_lag168'] = lag168_data.iloc[-1]['electricity_consumption'] if 'electricity_consumption' in lag168_data.columns else 0.0
+                # Rolling means (4h và 24h) - tính từ dữ liệu quá khứ
+                if len(current_idx) >= 4:
+                    # Rolling mean 4h
+                    recent_4h = current_idx.tail(4)['electricity_consumption'].values
+                    lag_features['electricity_rolling_mean_4h'] = np.mean(recent_4h) if len(recent_4h) > 0 else 0.0
                 
-                # Rolling statistics (last 24 hours)
-                last_24h = current_idx.tail(24)
-                if len(last_24h) > 0 and 'electricity_consumption' in last_24h.columns:
-                    lag_features['electricity_rolling_mean_24h'] = last_24h['electricity_consumption'].mean()
-                    lag_features['electricity_rolling_std_24h'] = last_24h['electricity_consumption'].std() if len(last_24h) > 1 else 0.0
-                
-                # Rolling mean 7 days (168 hours)
-                last_7d = current_idx.tail(168)
-                if len(last_7d) > 0 and 'electricity_consumption' in last_7d.columns:
-                    lag_features['electricity_rolling_mean_7d'] = last_7d['electricity_consumption'].mean()
+                if len(current_idx) >= 24:
+                    # Rolling mean 24h
+                    recent_24h = current_idx.tail(24)['electricity_consumption'].values
+                    lag_features['electricity_rolling_mean_24h'] = np.mean(recent_24h) if len(recent_24h) > 0 else 0.0
             
-            # If no historical data, use mean from all buildings
-            if all(v == 0.0 for v in lag_features.values()):
-                if 'electricity_consumption' in self._historical_data.columns:
-                    mean_consumption = self._historical_data['electricity_consumption'].mean()
-                    lag_features['electricity_rolling_mean_24h'] = mean_consumption
-                    lag_features['electricity_rolling_mean_7d'] = mean_consumption
+            # If no historical data, lag features sẽ là 0.0 (đã set mặc định)
         
         except Exception as e:
             print(f"⚠️  Error getting lag features: {e}")
@@ -330,9 +319,8 @@ class ElectricityConsumptionInference:
         lag_features = {}
         if include_lag:
             # Check if lag features are already provided in data (e.g., from previous predictions)
-            lag_feature_names = ['electricity_lag1', 'electricity_lag24', 'electricity_lag168',
-                                'electricity_rolling_mean_24h', 'electricity_rolling_std_24h',
-                                'electricity_rolling_mean_7d']
+            # CHỈ GIỮ electricity_lag24 và rolling means (BỎ lag1)
+            lag_feature_names = ['electricity_lag24', 'electricity_rolling_mean_4h', 'electricity_rolling_mean_24h']
             if any(feat in data for feat in lag_feature_names):
                 # Use provided lag features
                 for feat in lag_feature_names:
@@ -386,6 +374,44 @@ class ElectricityConsumptionInference:
                         features[feat] = 0.0
                 else:
                     features[feat] = float(value) if pd.notna(value) else 0.0
+        
+        # Calculate Dynamic and Interaction Features
+        # 1. Active Occupants (điều chỉnh theo giờ và ngày)
+        if 'occupants' in features and 'hour' in time_features and 'day_of_week' in time_features:
+            hour = time_features['hour']
+            day_of_week = time_features['day_of_week']
+            base_occupants = features.get('occupants', 0)
+            
+            # Hệ số theo giờ
+            if 8 <= hour <= 18:
+                hour_factor = 1.0
+            elif 6 <= hour <= 22:
+                hour_factor = 0.7
+            else:
+                hour_factor = 0.3
+            
+            # Hệ số theo ngày
+            if day_of_week < 5:  # Mon-Fri
+                day_factor = 1.0
+            else:  # Sat-Sun
+                day_factor = 0.5
+            
+            features['active_occupants'] = base_occupants * hour_factor * day_factor
+        elif 'occupants' in features:
+            # Fallback: nếu không có time features, dùng occupants trực tiếp
+            features['active_occupants'] = features.get('occupants', 0)
+        
+        # 2. Interaction Features
+        if 'airTemperature' in features and 'sqm' in features:
+            features['cooling_load'] = features['airTemperature'] * features['sqm']
+        
+        if 'active_occupants' in features and 'sqm' in features:
+            features['people_density'] = features['active_occupants'] / (features['sqm'] + 1e-6)
+        
+        if 'active_occupants' in features and 'occupants' in features:
+            # Occupancy ratio (giả sử max = 2 * median, nhưng ở đây dùng 2 * current occupants)
+            max_occupants = features['occupants'] * 2 if features['occupants'] > 0 else 1.0
+            features['occupancy_ratio'] = features['active_occupants'] / (max_occupants + 1e-6)
         
         # Categorical features
         for feat in self.categorical_features:
@@ -717,26 +743,26 @@ class ElectricityConsumptionInference:
                 })
             
             # Use previous predictions as lag features if available
+            # CHỈ DÙNG electricity_lag24 và rolling means (BỎ lag1)
             if i > 0 and len(previous_predictions) > 0:
                 # Override lag features with previous predictions
-                data['electricity_lag1'] = previous_predictions[-1] if len(previous_predictions) >= 1 else 0.0
                 data['electricity_lag24'] = previous_predictions[-24] if len(previous_predictions) >= 24 else 0.0
-                data['electricity_lag168'] = previous_predictions[-168] if len(previous_predictions) >= 168 else 0.0
                 
-                # Rolling statistics
+                # Rolling means từ previous predictions
+                if len(previous_predictions) >= 4:
+                    data['electricity_rolling_mean_4h'] = np.mean(previous_predictions[-4:])
+                else:
+                    data['electricity_rolling_mean_4h'] = np.mean(previous_predictions) if len(previous_predictions) > 0 else 0.0
+                
                 if len(previous_predictions) >= 24:
-                    last_24 = previous_predictions[-24:]
-                    data['electricity_rolling_mean_24h'] = np.mean(last_24)
-                    data['electricity_rolling_std_24h'] = np.std(last_24) if len(last_24) > 1 else 0.0
+                    data['electricity_rolling_mean_24h'] = np.mean(previous_predictions[-24:])
                 else:
-                    data['electricity_rolling_mean_24h'] = np.mean(previous_predictions) if previous_predictions else 0.0
-                    data['electricity_rolling_std_24h'] = 0.0
+                    data['electricity_rolling_mean_24h'] = np.mean(previous_predictions) if len(previous_predictions) > 0 else 0.0
                 
-                if len(previous_predictions) >= 168:
-                    last_168 = previous_predictions[-168:]
-                    data['electricity_rolling_mean_7d'] = np.mean(last_168)
-                else:
-                    data['electricity_rolling_mean_7d'] = np.mean(previous_predictions) if previous_predictions else 0.0
+                # BỎ các lag features khác (không dùng trong model mới)
+                # data['electricity_lag168'] = ...
+                # data['electricity_rolling_std_24h'] = ...
+                # data['electricity_rolling_mean_7d'] = ...
             
             # Predict (include historical lag only for first prediction)
             include_lag = (i == 0)
@@ -744,6 +770,128 @@ class ElectricityConsumptionInference:
             
             # Store prediction for future lag features
             previous_predictions.append(prediction)
+            
+            predictions.append({
+                'building_id': building_id,
+                'timestamp': current_time,
+                'predicted_consumption': prediction,
+                'hour': i + 1
+            })
+        
+        return pd.DataFrame(predictions)
+    
+    def predict_future_with_current_consumption(self,
+                                                building_id: str,
+                                                start_time: Union[str, datetime],
+                                                current_electricity_consumption: float,
+                                                hours: int = 24,
+                                                weather_data: Optional[List[Dict]] = None,
+                                                building_data: Optional[Dict] = None) -> pd.DataFrame:
+        """
+        Predict electricity consumption for future hours using current consumption as input.
+        
+        This method uses the current electricity consumption to initialize lag features,
+        then recursively predicts future hours (each prediction feeds into the next).
+        
+        Args:
+            building_id: Building ID
+            start_time: Start timestamp (e.g., '2016-01-01T21:00:00')
+            current_electricity_consumption: Current electricity consumption at start_time (kWh)
+            hours: Number of hours to predict into the future
+            weather_data: Optional list of weather data for each hour
+            building_data: Optional building metadata
+            
+        Returns:
+            DataFrame with predictions for each hour, including:
+            - building_id
+            - timestamp
+            - predicted_consumption
+            - hour (1-indexed hour number)
+            
+        Example:
+            >>> inference = ElectricityConsumptionInference()
+            >>> result = inference.predict_future_with_current_consumption(
+            ...     building_id='Bear_education_Sharon',
+            ...     start_time='2016-01-01T21:00:00',
+            ...     current_electricity_consumption=50.0,
+            ...     hours=24
+            ... )
+            >>> # Result will contain predictions for 22:00, 23:00, ..., 21:00 (next day)
+        """
+        if isinstance(start_time, str):
+            start_time = pd.to_datetime(start_time)
+        elif isinstance(start_time, datetime):
+            start_time = pd.Timestamp(start_time)
+        
+        # Load building data if not provided
+        if building_data is None:
+            if self._historical_data is not None:
+                building_info = self._historical_data[
+                    self._historical_data['building_id'] == building_id
+                ].iloc[0].to_dict() if len(self._historical_data[
+                    self._historical_data['building_id'] == building_id
+                ]) > 0 else {}
+            else:
+                building_info = {}
+        else:
+            building_info = building_data.copy()
+        
+        building_info['building_id'] = building_id
+        
+        predictions = []
+        # Initialize with current consumption for rolling means
+        consumption_history = [current_electricity_consumption]
+        
+        for i in range(hours):
+            current_time = start_time + timedelta(hours=i)
+            
+            # Prepare data for this hour
+            data = building_info.copy()
+            data['time'] = current_time
+            
+            # Add weather data if provided
+            if weather_data and i < len(weather_data):
+                weather = weather_data[i]
+                data.update({
+                    'airTemperature': weather.get('airTemperature') or weather.get('air_temperature'),
+                    'cloudCoverage': weather.get('cloudCoverage') or weather.get('cloud_coverage'),
+                    'dewTemperature': weather.get('dewTemperature') or weather.get('dew_temperature'),
+                    'windSpeed': weather.get('windSpeed') or weather.get('wind_speed'),
+                    'seaLvlPressure': weather.get('seaLvlPressure') or weather.get('sea_lvl_pressure'),
+                    'precipDepth1HR': weather.get('precipDepth1HR') or weather.get('precip_depth_1hr'),
+                })
+            
+            # Calculate lag features from consumption history
+            # For first prediction (i=0), use current consumption
+            # For subsequent predictions, use previous predictions
+            
+            # electricity_lag24: consumption 24 hours ago (if available)
+            if len(consumption_history) >= 24:
+                data['electricity_lag24'] = consumption_history[-24]
+            else:
+                # If we don't have 24 hours of history, try to get from historical data
+                if i == 0 and self._historical_data is not None:
+                    lag_features = self._get_lag_features(building_id, start_time)
+                    data['electricity_lag24'] = lag_features.get('electricity_lag24', 0.0)
+                else:
+                    data['electricity_lag24'] = 0.0
+            
+            # Rolling means from consumption history
+            if len(consumption_history) >= 4:
+                data['electricity_rolling_mean_4h'] = np.mean(consumption_history[-4:])
+            else:
+                data['electricity_rolling_mean_4h'] = np.mean(consumption_history) if len(consumption_history) > 0 else 0.0
+            
+            if len(consumption_history) >= 24:
+                data['electricity_rolling_mean_24h'] = np.mean(consumption_history[-24:])
+            else:
+                data['electricity_rolling_mean_24h'] = np.mean(consumption_history) if len(consumption_history) > 0 else 0.0
+            
+            # Predict (don't use historical lag since we're providing it manually)
+            prediction = self.predict(data, include_lag=False)
+            
+            # Store prediction for future lag features
+            consumption_history.append(prediction)
             
             predictions.append({
                 'building_id': building_id,

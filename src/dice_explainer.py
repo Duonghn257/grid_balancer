@@ -104,20 +104,34 @@ class DiceExplainer:
             Dictionary mapping feature names to their constraints
         """
         return {
-            # Building features that can be adjusted
+            # Building features - FIXED (cannot be changed)
             'sqm': {
-                'adjustable': True,
-                'direction': 'decrease',  # Can only decrease (reduce space)
-                'min_change_pct': 0.05,  # Minimum 5% change
-                'max_change_pct': 0.30,  # Maximum 30% change
-                'description': 'Building area (square meters)'
+                'adjustable': False,  # Cannot change building area - this is a fixed physical property
+                'description': 'Building area (square meters) - FIXED'
             },
             'occupants': {
                 'adjustable': True,
                 'direction': 'decrease',
                 'min_change_pct': 0.10,
-                'max_change_pct': 0.50,
-                'description': 'Number of occupants'
+                'max_change_pct': 1.0,  # Allow up to 100% reduction for more flexibility
+                'description': 'Number of occupants (can adjust occupancy)'
+            },
+            # Dynamic and Interaction Features (derived from other features)
+            'active_occupants': {
+                'adjustable': False,  # Derived from occupants and time
+                'description': 'Active occupants (calculated from occupants and time)'
+            },
+            'cooling_load': {
+                'adjustable': False,  # Derived from airTemperature * sqm
+                'description': 'Cooling load (calculated from temperature and area)'
+            },
+            'people_density': {
+                'adjustable': False,  # Derived from active_occupants / sqm
+                'description': 'People density (calculated from occupants and area)'
+            },
+            'occupancy_ratio': {
+                'adjustable': False,  # Derived from active_occupants / max_occupants
+                'description': 'Occupancy ratio (calculated from active occupants)'
             },
             'numberoffloors': {
                 'adjustable': False,  # Cannot change building structure
@@ -127,24 +141,40 @@ class DiceExplainer:
                 'adjustable': False,
                 'description': 'Year built (fixed)'
             },
-            # Weather/operational features
+            # Weather features - FIXED (cannot control weather)
             'airTemperature': {
-                'adjustable': True,
-                'direction': 'both',  # Can adjust HVAC
-                'min_change': 1.0,  # Minimum 1°C change
-                'max_change': 5.0,  # Maximum 5°C change
-                'description': 'Air temperature (can adjust HVAC)'
+                'adjustable': False,  # This is outdoor air temperature (weather data), not HVAC setpoint
+                'description': 'Air temperature (weather data - cannot control)'
+            },
+            'cloudCoverage': {
+                'adjustable': False,
+                'description': 'Cloud coverage (weather data - cannot control)'
+            },
+            'dewTemperature': {
+                'adjustable': False,
+                'description': 'Dew temperature (weather data - cannot control)'
+            },
+            'windSpeed': {
+                'adjustable': False,
+                'description': 'Wind speed (weather data - cannot control)'
+            },
+            'seaLvlPressure': {
+                'adjustable': False,
+                'description': 'Sea level pressure (weather data - cannot control)'
+            },
+            'precipDepth1HR': {
+                'adjustable': False,
+                'description': 'Precipitation depth (weather data - cannot control)'
             },
             # Time features (can adjust schedule)
             'hour': {
-                'adjustable': True,
-                'direction': 'both',
+                'adjustable': False,
+                # 'direction': 'both',
                 'description': 'Hour of day (can adjust schedule)'
             },
             'is_weekend': {
-                'adjustable': True,
-                'direction': 'both',
-                'description': 'Weekend flag (can adjust schedule)'
+                'adjustable': False,  # Cannot change day of week - this is determined by timestamp
+                'description': 'Weekend flag (fixed - determined by timestamp)'
             },
             # Fixed features
             'primaryspaceusage': {
@@ -171,6 +201,10 @@ class DiceExplainer:
             'electricity_lag168': {
                 'adjustable': False,
                 'description': 'Lag 168 hours (depends on past)'
+            },
+            'electricity_rolling_mean_4h': {
+                'adjustable': False,
+                'description': 'Rolling mean 4h (depends on past)'
             },
             'electricity_rolling_mean_24h': {
                 'adjustable': False,
@@ -553,6 +587,21 @@ class DiceExplainer:
             # Get permitted ranges for actionable features
             permitted_range = self._get_permitted_ranges(query_instance, json_data)
             
+            # Check if we have any actionable features
+            actionable_features_list = [
+                feat for feat in self.get_actionable_features() 
+                if feat in query_instance.columns
+            ]
+            
+            if not actionable_features_list:
+                return {
+                    'success': False,
+                    'error': 'No actionable features available. Cannot generate counterfactuals.',
+                    'current_prediction': float(current_prediction),
+                    'threshold': float(threshold),
+                    'recommendations': []
+                }
+            
             # Remove target column from query instance (DiCE doesn't want it)
             query_instance_for_dice = query_instance.drop(columns=['electricity_consumption'], errors='ignore')
             
@@ -566,23 +615,71 @@ class DiceExplainer:
                         method=method
                     )
                 
+                # Strategy: Use a narrower desired_range to encourage values closer to threshold
+                # Instead of [0, threshold], use [threshold * 0.85, threshold] to get more realistic recommendations
+                # This helps avoid extreme reductions
+                desired_range_min = max(0.0, threshold * 0.85)  # At least 85% of threshold
+                desired_range_max = threshold
+                
+                # Debug: Print actionable features and permitted ranges
+                print(f"   📋 Actionable features: {actionable_features_list}")
+                if permitted_range:
+                    print(f"   📋 Permitted ranges: {list(permitted_range.keys())}")
+                    for feat, (min_val, max_val) in permitted_range.items():
+                        current_val = query_instance_for_dice[feat].iloc[0] if feat in query_instance_for_dice.columns else "N/A"
+                        print(f"      • {feat}: [{min_val:.2f}, {max_val:.2f}] (current: {current_val})")
+                else:
+                    print(f"   ⚠️  No permitted ranges set (DiCE will use default ranges)")
+                
+                print(f"   🎯 Desired range: [{desired_range_min:.2f}, {desired_range_max:.2f}] kWh")
+                
                 # Prepare parameters based on method
+                
                 cf_params = {
                     'query_instances': query_instance_for_dice,
-                    'total_CFs': total_cfs,
-                    'desired_range': [0, threshold],
-                    'permitted_range': permitted_range
+                    'total_CFs': total_cfs * 2,  # Generate more to have better chance of finding realistic ones
+                    'desired_range': [desired_range_min, desired_range_max]
                 }
                 
-                # Add weight parameters only for genetic method
+                # Only add permitted_range if it's not empty
+                if permitted_range:
+                    cf_params['permitted_range'] = permitted_range
+                
+                # Note: features_to_vary may not be supported in all DiCE versions
+                # Instead, we rely on permitted_range to constrain changes
+                # If needed, we can filter counterfactuals later to only show actionable changes
+                
+                # Add weight parameters - prioritize proximity to original instance
                 if method == 'genetic':
                     cf_params.update({
-                        'proximity_weight': 0.5,
-                        'diversity_weight': 1.0,
-                        'sparsity_weight': 0.1
+                        'proximity_weight': 10.0,  # Higher weight to stay close to original
+                        'diversity_weight': 0.1,
+                        'sparsity_weight': 1.0  # Moderate sparsity
                     })
+                elif method == 'random':
+                    # For random method, we can't set weights, but we generate more CFs
+                    pass
                 
-                counterfactuals = self.explainer.generate_counterfactuals(**cf_params)
+                print(f"   🔍 Generating counterfactuals with method='{method}'...")
+                print(f"   ⏱️  This may take a moment...")
+                
+                # Generate counterfactuals with timeout protection
+                try:
+                    counterfactuals = self.explainer.generate_counterfactuals(**cf_params)
+                except Exception as e:
+                    # If genetic method fails or is too slow, try random method
+                    if method == 'genetic':
+                        print(f"   ⚠️  Genetic method failed or too slow: {e}")
+                        print(f"   🔄 Falling back to 'random' method...")
+                        # Recreate explainer with random method
+                        self.explainer = Dice(
+                            self.dice_data,
+                            self.dice_model,
+                            method='random'
+                        )
+                        counterfactuals = self.explainer.generate_counterfactuals(**cf_params)
+                    else:
+                        raise
                 
                 # Extract counterfactual data
                 if not hasattr(counterfactuals, 'cf_examples_list') or not counterfactuals.cf_examples_list:
@@ -657,13 +754,42 @@ class DiceExplainer:
                                         cf_data[key] = value
                                         break
                     
-                    # Predict
+                    # Predict counterfactual
+                    # NOTE: Sau khi retrain với chỉ electricity_lag1, lag features sẽ ít chi phối hơn
+                    # Model sẽ nhạy cảm hơn với thay đổi của occupants và các features khác
                     try:
-                        cf_pred = self.inference.predict(cf_data, include_lag=False)
+                        # Strategy: Scale electricity_lag1 theo reduction ratio của occupants
+                        # Điều này phản ánh mối quan hệ: nếu giảm occupants, lag features cũng nên giảm
+                        
+                        # Get original lag features
+                        X_original = self.inference._preprocess_input(json_data, include_lag=True)
+                        
+                        # Estimate reduction ratio based on feature changes
+                        reduction_ratio = 1.0
+                        if 'occupants' in cf_dict and 'occupants' in json_data:
+                            orig_occ = float(json_data['occupants'])
+                            cf_occ = float(cf_dict.get('occupants', orig_occ))
+                            if orig_occ > 0:
+                                # Assume linear relationship (có thể cải thiện sau)
+                                reduction_ratio = cf_occ / orig_occ
+                        
+                        # Scale lag features proportionally
+                        cf_data_with_lag = cf_data.copy()
+                        # CHỈ DÙNG lag24 và rolling means (BỎ lag1)
+                        lag_feature_names = ['electricity_lag24', 'electricity_rolling_mean_4h', 'electricity_rolling_mean_24h']
+                        for lag_feat in lag_feature_names:
+                            if lag_feat in X_original.columns:
+                                original_lag = float(X_original[lag_feat].iloc[0])
+                                # Scale by reduction ratio, but keep minimum to avoid zero
+                                scaled_lag = max(0.1, original_lag * reduction_ratio)
+                                cf_data_with_lag[lag_feat] = scaled_lag
+                        
+                        # Predict with scaled lag features
+                        cf_pred = self.inference.predict(cf_data_with_lag, include_lag=True)
                         cf_predictions.append(cf_pred)
                         
-                        # Calculate changes
-                        changes = self._calculate_changes(json_data, cf_dict, current_prediction, cf_pred)
+                        # Calculate changes - pass the query_instance_for_dice for better comparison
+                        changes = self._calculate_changes(json_data, cf_dict, current_prediction, cf_pred, query_instance_for_dice)
                         
                         recommendations.append({
                             'counterfactual_id': idx,
@@ -677,8 +803,41 @@ class DiceExplainer:
                         print(f"⚠️  Error predicting counterfactual {idx}: {e}")
                         continue
                 
-                # Sort by reduction amount
-                recommendations.sort(key=lambda x: x['reduction'], reverse=True)
+                # Sort recommendations to prioritize those closest to threshold (but still below it)
+                # This gives more realistic recommendations instead of extreme reductions
+                def sort_key(rec):
+                    pred = rec['predicted_consumption']
+                    # Prioritize: 1) Below threshold, 2) Closest to threshold
+                    if pred <= threshold:
+                        # For values below threshold, prefer those closer to threshold
+                        # Use negative distance from threshold (closer = higher priority)
+                        return (0, -(threshold - pred))
+                    else:
+                        # Values above threshold have lower priority
+                        return (1, pred)
+                
+                recommendations.sort(key=sort_key)
+                
+                # Filter to prioritize realistic recommendations (within 80-100% of threshold)
+                # This helps avoid extreme reductions that may not be practical
+                # Users typically want moderate reductions, not extreme ones
+                realistic_threshold_min = threshold * 0.8
+                realistic_recommendations = [
+                    rec for rec in recommendations 
+                    if rec['predicted_consumption'] >= realistic_threshold_min and rec['predicted_consumption'] <= threshold
+                ]
+                
+                # If we have realistic recommendations, prioritize them
+                if realistic_recommendations:
+                    # Sort realistic ones by proximity to threshold
+                    realistic_recommendations.sort(key=lambda r: abs(r['predicted_consumption'] - threshold))
+                    # Keep top realistic ones first, then add others for diversity (but limit to 2 extreme ones)
+                    extreme_ones = [r for r in recommendations if r not in realistic_recommendations][:2]
+                    recommendations = realistic_recommendations[:3] + extreme_ones
+                else:
+                    # If no realistic recommendations, at least try to get ones closer to threshold
+                    # Take top 3 closest to threshold
+                    recommendations = recommendations[:3]
                 
                 return {
                     'success': True,
@@ -822,6 +981,9 @@ class DiceExplainer:
                 min_val = max(min_val, 100)  # Minimum 100 sqm
             elif feat == 'occupants':
                 min_val = max(min_val, 1)  # Minimum 1 occupant
+                # Ensure max is reasonable (at least 10% reduction possible)
+                if max_val <= min_val:
+                    max_val = current_value  # Can't increase, but can decrease
             elif feat == 'airTemperature':
                 min_val = max(min_val, -10)  # Reasonable temperature range
                 max_val = min(max_val, 50)
@@ -829,7 +991,9 @@ class DiceExplainer:
                 min_val = 0
                 max_val = 23
             
-            permitted_range[feat] = [float(min_val), float(max_val)]
+            # Only add if range is valid
+            if min_val < max_val:
+                permitted_range[feat] = [float(min_val), float(max_val)]
         
         return permitted_range
     
@@ -837,15 +1001,17 @@ class DiceExplainer:
                           original_data: Dict,
                           counterfactual: Dict,
                           original_pred: float,
-                          cf_pred: float) -> List[Dict]:
+                          cf_pred: float,
+                          query_instance: Optional[pd.DataFrame] = None) -> List[Dict]:
         """
         Calculate and format changes between original and counterfactual.
         
         Args:
-            original_data: Original data
-            counterfactual: Counterfactual data
+            original_data: Original data (JSON format)
+            counterfactual: Counterfactual data (from DiCE, may have preprocessed features)
             original_pred: Original prediction
             cf_pred: Counterfactual prediction
+            query_instance: Optional DataFrame with preprocessed query instance for comparison
             
         Returns:
             List of change descriptions
@@ -859,23 +1025,33 @@ class DiceExplainer:
             if feat not in counterfactual or feat == 'electricity_consumption':
                 continue
             
-            # Try to get original value
-            orig_val = original_data.get(feat)
+            # Try to get original value from query_instance first (more accurate)
+            if query_instance is not None and feat in query_instance.columns:
+                try:
+                    orig_val = query_instance[feat].iloc[0]
+                except:
+                    orig_val = None
+            else:
+                orig_val = None
+            
+            # Fallback to original_data if not found in query_instance
             if orig_val is None:
-                # Try alternative names
-                alt_names = {
-                    'airTemperature': ['air_temperature', 'temperature'],
-                    'cloudCoverage': ['cloud_coverage'],
-                    'dewTemperature': ['dew_temperature'],
-                    'windSpeed': ['wind_speed'],
-                    'seaLvlPressure': ['sea_lvl_pressure'],
-                    'precipDepth1HR': ['precip_depth_1hr']
-                }
-                if feat in alt_names:
-                    for alt in alt_names[feat]:
-                        if alt in original_data:
-                            orig_val = original_data[alt]
-                            break
+                orig_val = original_data.get(feat)
+                if orig_val is None:
+                    # Try alternative names
+                    alt_names = {
+                        'airTemperature': ['air_temperature', 'temperature'],
+                        'cloudCoverage': ['cloud_coverage'],
+                        'dewTemperature': ['dew_temperature'],
+                        'windSpeed': ['wind_speed'],
+                        'seaLvlPressure': ['sea_lvl_pressure'],
+                        'precipDepth1HR': ['precip_depth_1hr']
+                    }
+                    if feat in alt_names:
+                        for alt in alt_names[feat]:
+                            if alt in original_data:
+                                orig_val = original_data[alt]
+                                break
             
             if orig_val is None:
                 continue
@@ -886,12 +1062,48 @@ class DiceExplainer:
             if pd.isna(orig_val) or pd.isna(cf_val):
                 continue
             
+            # Handle time features that might be strings in DiCE
+            time_features = ['hour', 'day_of_week', 'month', 'year', 'is_weekend']
+            if feat in time_features:
+                # Convert both to comparable format
+                try:
+                    orig_val_num = int(float(str(orig_val).replace('"', '').replace("'", '')))
+                    cf_val_num = int(float(str(cf_val).replace('"', '').replace("'", '')))
+                    if orig_val_num != cf_val_num:
+                        feat_info = self.actionable_features.get(feat, {})
+                        changes.append({
+                            'feature': feat,
+                            'description': feat_info.get('description', feat),
+                            'original_value': orig_val_num,
+                            'suggested_value': cf_val_num,
+                            'change': cf_val_num - orig_val_num,
+                            'change_pct': None,
+                            'action': self._get_action_description(feat, float(orig_val_num), float(cf_val_num))
+                        })
+                    continue
+                except (ValueError, TypeError):
+                    # If conversion fails, treat as categorical
+                    if str(orig_val).strip() != str(cf_val).strip():
+                        feat_info = self.actionable_features.get(feat, {})
+                        changes.append({
+                            'feature': feat,
+                            'description': feat_info.get('description', feat),
+                            'original_value': str(orig_val),
+                            'suggested_value': str(cf_val),
+                            'change': None,
+                            'change_pct': None,
+                            'action': f"Change {feat} from '{orig_val}' to '{cf_val}'"
+                        })
+                    continue
+            
+            # Handle numeric features
             try:
-                orig_val = float(orig_val)
-                cf_val = float(cf_val)
+                # Convert to float, handling string representations
+                orig_val_float = float(str(orig_val).replace('"', '').replace("'", ''))
+                cf_val_float = float(str(cf_val).replace('"', '').replace("'", ''))
                 
-                change = cf_val - orig_val
-                change_pct = (change / orig_val * 100) if orig_val != 0 else 0
+                change = cf_val_float - orig_val_float
+                change_pct = (change / orig_val_float * 100) if orig_val_float != 0 else 0
                 
                 # Only include significant changes (>1% or >0.1 absolute)
                 if abs(change_pct) > 1 or abs(change) > 0.1:
@@ -899,15 +1111,15 @@ class DiceExplainer:
                     changes.append({
                         'feature': feat,
                         'description': feat_info.get('description', feat),
-                        'original_value': orig_val,
-                        'suggested_value': cf_val,
+                        'original_value': orig_val_float,
+                        'suggested_value': cf_val_float,
                         'change': change,
                         'change_pct': change_pct,
-                        'action': self._get_action_description(feat, orig_val, cf_val)
+                        'action': self._get_action_description(feat, orig_val_float, cf_val_float)
                     })
             except (ValueError, TypeError):
                 # Handle categorical or non-numeric features
-                if str(orig_val) != str(cf_val):
+                if str(orig_val).strip() != str(cf_val).strip():
                     feat_info = self.actionable_features.get(feat, {})
                     changes.append({
                         'feature': feat,
@@ -1328,3 +1540,166 @@ class DiceExplainer:
         except ImportError:
             print("⚠️  openpyxl not available. Install with: pip install openpyxl")
             return ""
+    
+    def predict_future_with_monitoring(self,
+                                      json_data: Dict,
+                                      current_electricity_consumption: float,
+                                      hours: int = 24,
+                                      threshold: float = 50.0,
+                                      weather_data: Optional[List[Dict]] = None) -> Dict:
+        """
+        Predict future electricity consumption with threshold monitoring and DICE recommendations.
+        
+        This method:
+        1. Uses current electricity consumption as input
+        2. Recursively predicts future hours (each prediction feeds into the next)
+        3. Monitors for threshold violations at each time step
+        4. Generates DICE recommendations when threshold is exceeded
+        
+        Args:
+            json_data: Dictionary with building and weather data at start time
+            current_electricity_consumption: Current electricity consumption at start time (kWh)
+            hours: Number of hours to predict into the future
+            threshold: Consumption threshold (kWh) - will trigger warnings if exceeded
+            weather_data: Optional list of weather data for each hour
+            
+        Returns:
+            Dictionary containing:
+            - predictions: DataFrame with predictions for each hour
+            - alerts: List of alerts when threshold is exceeded
+            - recommendations: List of DICE recommendations for each alert
+            
+        Example:
+            >>> explainer = DiceExplainer()
+            >>> json_data = {
+            ...     'time': '2016-01-01T21:00:00',
+            ...     'building_id': 'Bear_education_Sharon',
+            ...     'sqm': 5261.7,
+            ...     'occupants': 200,
+            ...     'airTemperature': 25.0,
+            ...     # ... other features
+            ... }
+            >>> result = explainer.predict_future_with_monitoring(
+            ...     json_data=json_data,
+            ...     current_electricity_consumption=50.0,
+            ...     hours=24,
+            ...     threshold=50.0
+            ... )
+            >>> # Check alerts
+            >>> for alert in result['alerts']:
+            ...     print(f"Alert at {alert['timestamp']}: {alert['predicted_consumption']} kWh")
+            ...     print(f"Recommendations: {alert['recommendations']}")
+        """
+        # Extract building_id and start_time
+        building_id = json_data.get('building_id') or json_data.get('building_code')
+        if not building_id:
+            raise ValueError("'building_id' or 'building_code' is required in json_data")
+        
+        start_time = json_data.get('time') or json_data.get('timestamp')
+        if not start_time:
+            raise ValueError("'time' or 'timestamp' is required in json_data")
+        
+        # Prepare building_data (exclude time and weather, keep building metadata)
+        building_data = json_data.copy()
+        # Remove time and weather fields (will be provided separately)
+        weather_fields = ['airTemperature', 'cloudCoverage', 'dewTemperature', 
+                        'windSpeed', 'seaLvlPressure', 'precipDepth1HR',
+                        'air_temperature', 'cloud_coverage', 'dew_temperature',
+                        'wind_speed', 'sea_lvl_pressure', 'precip_depth_1hr']
+        for field in ['time', 'timestamp'] + weather_fields:
+            building_data.pop(field, None)
+        
+        # Predict future consumption
+        predictions_df = self.inference.predict_future_with_current_consumption(
+            building_id=building_id,
+            start_time=start_time,
+            current_electricity_consumption=current_electricity_consumption,
+            hours=hours,
+            weather_data=weather_data,
+            building_data=building_data
+        )
+        
+        # Monitor for threshold violations
+        alerts = []
+        
+        for idx, row in predictions_df.iterrows():
+            predicted_consumption = row['predicted_consumption']
+            timestamp = row['timestamp']
+            
+            if predicted_consumption > threshold:
+                # Threshold exceeded - generate recommendations
+                # Prepare data for this time step
+                alert_data = building_data.copy()
+                alert_data['time'] = timestamp
+                
+                # Add weather data if available
+                hour_index = row['hour'] - 1  # hour is 1-indexed, convert to 0-indexed
+                if weather_data and hour_index < len(weather_data):
+                    weather = weather_data[hour_index]
+                    alert_data.update({
+                        'airTemperature': weather.get('airTemperature') or weather.get('air_temperature'),
+                        'cloudCoverage': weather.get('cloudCoverage') or weather.get('cloud_coverage'),
+                        'dewTemperature': weather.get('dewTemperature') or weather.get('dew_temperature'),
+                        'windSpeed': weather.get('windSpeed') or weather.get('wind_speed'),
+                        'seaLvlPressure': weather.get('seaLvlPressure') or weather.get('sea_lvl_pressure'),
+                        'precipDepth1HR': weather.get('precipDepth1HR') or weather.get('precip_depth_1hr'),
+                    })
+                elif 'airTemperature' in json_data:
+                    # Use weather from original json_data if available
+                    for field in weather_fields:
+                        if field in json_data:
+                            alert_data[field] = json_data[field]
+                
+                # Add predicted consumption as lag feature for more accurate recommendations
+                # Use the consumption from previous hour (if available)
+                if idx > 0:
+                    prev_consumption = predictions_df.iloc[idx - 1]['predicted_consumption']
+                    # Update rolling means based on recent predictions
+                    recent_predictions = predictions_df.iloc[max(0, idx-3):idx+1]['predicted_consumption'].values
+                    alert_data['electricity_rolling_mean_4h'] = float(np.mean(recent_predictions))
+                    
+                    # Also update lag24 if we have enough history
+                    if idx >= 24:
+                        alert_data['electricity_lag24'] = float(predictions_df.iloc[idx - 24]['predicted_consumption'])
+                
+                # Generate DICE recommendations
+                try:
+                    dice_result = self.generate_recommendations(
+                        json_data=alert_data,
+                        threshold=threshold,
+                        total_cfs=3,  # Generate 3 recommendations per alert
+                        method='random'  # Use 'random' for speed, can change to 'genetic' for better results
+                    )
+                    
+                    recommendations = dice_result.get('recommendations', []) if dice_result.get('success') else []
+                except Exception as e:
+                    print(f"⚠️  Error generating recommendations for {timestamp}: {e}")
+                    recommendations = []
+                
+                alerts.append({
+                    'timestamp': timestamp,
+                    'hour': row['hour'],
+                    'predicted_consumption': float(predicted_consumption),
+                    'threshold': float(threshold),
+                    'exceeded_by': float(predicted_consumption - threshold),
+                    'exceeded_by_pct': float((predicted_consumption - threshold) / threshold * 100),
+                    'recommendations': recommendations,
+                    'dice_success': dice_result.get('success', False) if 'dice_result' in locals() else False
+                })
+        
+        return {
+            'success': True,
+            'predictions': predictions_df,
+            'alerts': alerts,
+            'total_alerts': len(alerts),
+            'threshold': float(threshold),
+            'summary': {
+                'total_hours': hours,
+                'hours_above_threshold': len(alerts),
+                'max_consumption': float(predictions_df['predicted_consumption'].max()),
+                'min_consumption': float(predictions_df['predicted_consumption'].min()),
+                'mean_consumption': float(predictions_df['predicted_consumption'].mean()),
+                'first_alert_hour': alerts[0]['hour'] if alerts else None,
+                'last_alert_hour': alerts[-1]['hour'] if alerts else None
+            }
+        }

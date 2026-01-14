@@ -25,7 +25,7 @@ print("EXAMPLE: Building with High Consumption")
 print("=" * 80)
 
 json_data = {
-    'time': '2016-01-01T21:00:00',
+    'time': '2017-01-01T21:00:00',
     'building_id': 'Bear_education_Sharon',
     'site_id': 'Bear',
     'primaryspaceusage': 'Education',
@@ -47,20 +47,21 @@ json_data = {
 current_pred = explainer.inference.predict(json_data)
 print(f"\n📊 Current predicted consumption: {current_pred:.2f} kWh")
 
-# Set threshold (e.g., 100 kWh)
-threshold = 10.0
-print(f"🎯 Target threshold: {threshold} kWh")
+# Set threshold (e.g., 80% of current consumption for realistic reduction)
+threshold = current_pred * 0.8  # 80% of current = 20% reduction target
+print(f"🎯 Target threshold: {threshold:.2f} kWh (20% reduction target)")
 
 if current_pred > threshold:
     print(f"⚠️  Consumption exceeds threshold by {current_pred - threshold:.2f} kWh")
     print(f"\n🔍 Generating counterfactual recommendations...")
     
     # Generate recommendations
+    # Use 'random' method for faster results (change to 'genetic' for better quality but slower)
     result = explainer.generate_recommendations(
         json_data=json_data,
         threshold=threshold,
         total_cfs=5,
-        method='genetic'  # Use 'genetic' for better results, 'random' for faster
+        method='genetic'  # Use 'random' for faster results, 'genetic' for better quality
     )
     
     if result['success']:

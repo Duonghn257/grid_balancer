@@ -148,6 +148,67 @@ df_final['month_cos'] = np.cos(2 * np.pi * df_final['month'] / 12)
 print("✅ Đã tạo features thời gian cơ bản")
 
 # ============================================================================
+# 5.5. FEATURE ENGINEERING - DYNAMIC OCCUPANTS & INTERACTION FEATURES
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("BƯỚC 5.5: FEATURE ENGINEERING - DYNAMIC OCCUPANTS & INTERACTIONS")
+print("=" * 80)
+
+print("\n📊 Đang tạo Dynamic Occupants và Interaction Features...")
+
+# Dynamic Occupants: Điều chỉnh số người theo giờ trong ngày và ngày trong tuần
+# Giả định: Giờ làm việc (8-18h) và ngày làm việc (Mon-Fri) có nhiều người hơn
+def calculate_active_occupants(row):
+    """Tính số người hoạt động dựa trên giờ và ngày"""
+    hour = row['hour']
+    day_of_week = row['day_of_week']  # 0=Monday, 6=Sunday
+    
+    # Hệ số theo giờ (cao nhất vào giờ làm việc)
+    if 8 <= hour <= 18:
+        hour_factor = 1.0  # Giờ làm việc: 100%
+    elif 6 <= hour <= 22:
+        hour_factor = 0.7  # Giờ hoạt động: 70%
+    else:
+        hour_factor = 0.3  # Giờ nghỉ: 30%
+    
+    # Hệ số theo ngày (cuối tuần ít người hơn)
+    if day_of_week < 5:  # Mon-Fri
+        day_factor = 1.0
+    else:  # Sat-Sun
+        day_factor = 0.5
+    
+    # Tính active occupants
+    base_occupants = row.get('occupants', 0)
+    if pd.isna(base_occupants) or base_occupants <= 0:
+        return 0.0
+    
+    return base_occupants * hour_factor * day_factor
+
+# Tạo active_occupants
+df_final['active_occupants'] = df_final.apply(calculate_active_occupants, axis=1)
+
+# Interaction Features
+# 1. Cooling load: Nhiệt độ * Diện tích (diện tích lớn + nóng = tốn nhiều điện làm mát)
+if 'airTemperature' in df_final.columns and 'sqm' in df_final.columns:
+    df_final['cooling_load'] = df_final['airTemperature'] * df_final['sqm']
+    print("   ✅ Đã tạo cooling_load = airTemperature * sqm")
+
+# 2. People density: Số người / Diện tích (mật độ người)
+if 'active_occupants' in df_final.columns and 'sqm' in df_final.columns:
+    df_final['people_density'] = df_final['active_occupants'] / (df_final['sqm'] + 1e-6)  # Tránh chia 0
+    print("   ✅ Đã tạo people_density = active_occupants / sqm")
+
+# 3. Occupancy ratio: Tỷ lệ sử dụng (active_occupants / max_occupants)
+# Giả sử max_occupants = 2 * median(occupants) của building
+if 'active_occupants' in df_final.columns and 'occupants' in df_final.columns:
+    building_max_occupants = df_final.groupby('building_id')['occupants'].transform(lambda x: x.median() * 2)
+    df_final['occupancy_ratio'] = df_final['active_occupants'] / (building_max_occupants + 1e-6)
+    print("   ✅ Đã tạo occupancy_ratio = active_occupants / max_occupants")
+
+print("✅ Đã tạo Dynamic Occupants và Interaction Features")
+
+# ============================================================================
 # 6. FEATURE ENGINEERING - LAG FEATURES
 # ============================================================================
 
@@ -156,24 +217,20 @@ print("BƯỚC 6: FEATURE ENGINEERING - LAG FEATURES")
 print("=" * 80)
 
 print("\n📊 Đang tạo lag features...")
+print("   ⚠️  LOẠI BỎ electricity_lag1 để model học mối quan hệ nhân quả tốt hơn")
+print("   - electricity_lag1: BỎ (gây overfitting, làm DiCE không hoạt động)")
+print("   - electricity_lag24: GIỮ LẠI (đại diện cho thói quen sử dụng)")
+print("   - Rolling means: THÊM MỚI (thay thế lag1)")
 
-# Lag features (điện tiêu thụ giờ trước)
-df_final['electricity_lag1'] = df_final.groupby('building_id')['electricity_consumption'].shift(1)
-df_final['electricity_lag24'] = df_final.groupby('building_id')['electricity_consumption'].shift(24)  # Cùng giờ ngày hôm trước
-df_final['electricity_lag168'] = df_final.groupby('building_id')['electricity_consumption'].shift(168)  # Cùng giờ tuần trước
+# CHỈ GIỮ LẠI electricity_lag24 (cùng giờ ngày hôm trước - đại diện cho thói quen)
+# BỎ electricity_lag1 để model phải học từ các features khác (occupants, temperature, etc.)
+df_final['electricity_lag24'] = df_final.groupby('building_id')['electricity_consumption'].shift(24)
 
-# Rolling statistics
-df_final['electricity_rolling_mean_24h'] = df_final.groupby('building_id')['electricity_consumption'].transform(
-    lambda x: x.rolling(window=24, min_periods=1).mean()
-)
-df_final['electricity_rolling_std_24h'] = df_final.groupby('building_id')['electricity_consumption'].transform(
-    lambda x: x.rolling(window=24, min_periods=1).std()
-)
-df_final['electricity_rolling_mean_7d'] = df_final.groupby('building_id')['electricity_consumption'].transform(
-    lambda x: x.rolling(window=168, min_periods=1).mean()
-)
+# Rolling means (thay thế lag1 - ít gây overfitting hơn)
+df_final['electricity_rolling_mean_4h'] = df_final.groupby('building_id')['electricity_consumption'].shift(1).rolling(window=4, min_periods=1).mean().reset_index(0, drop=True)
+df_final['electricity_rolling_mean_24h'] = df_final.groupby('building_id')['electricity_consumption'].shift(1).rolling(window=24, min_periods=1).mean().reset_index(0, drop=True)
 
-print("✅ Đã tạo lag features và rolling statistics")
+print("✅ Đã tạo lag features (chỉ electricity_lag24 + rolling means)")
 
 # ============================================================================
 # 7. XỬ LÝ MISSING VALUES
@@ -189,7 +246,9 @@ print("\n📊 Đang xử lý missing values...")
 continuous_features = [
     'sqm', 'yearbuilt', 'numberoffloors', 'occupants',
     'airTemperature', 'cloudCoverage', 'dewTemperature', 
-    'windSpeed', 'seaLvlPressure', 'precipDepth1HR'
+    'windSpeed', 'seaLvlPressure', 'precipDepth1HR',
+    # Dynamic và Interaction features
+    'active_occupants', 'cooling_load', 'people_density', 'occupancy_ratio'
 ]
 
 categorical_features = [
@@ -223,14 +282,11 @@ for col in categorical_features:
             df_final[col].mode()[0] if len(df_final[col].mode()) > 0 else 'Unknown'
         )
 
-# Fill missing values cho lag features (bằng 0 hoặc giá trị hiện tại)
-for col in ['electricity_lag1', 'electricity_lag24', 'electricity_lag168']:
+# Fill missing values cho lag features và rolling means (bằng 0 hoặc median)
+for col in ['electricity_lag24', 'electricity_rolling_mean_4h', 'electricity_rolling_mean_24h']:
     if col in df_final.columns:
+        # Fill bằng 0 cho lag features (không có dữ liệu quá khứ)
         df_final[col] = df_final[col].fillna(0)
-
-for col in ['electricity_rolling_mean_24h', 'electricity_rolling_std_24h', 'electricity_rolling_mean_7d']:
-    if col in df_final.columns:
-        df_final[col] = df_final[col].fillna(df_final['electricity_consumption'])
 
 print("✅ Đã xử lý missing values")
 
@@ -284,9 +340,9 @@ features_info = {
     'time_features': ['hour', 'day_of_week', 'month', 'year', 'is_weekend', 'season',
                       'hour_sin', 'hour_cos', 'day_of_week_sin', 'day_of_week_cos', 
                       'month_sin', 'month_cos'],
-    'lag_features': ['electricity_lag1', 'electricity_lag24', 'electricity_lag168',
-                     'electricity_rolling_mean_24h', 'electricity_rolling_std_24h', 
-                     'electricity_rolling_mean_7d'],
+    'lag_features': ['electricity_lag24', 'electricity_rolling_mean_4h', 'electricity_rolling_mean_24h'],  # BỎ lag1, thêm rolling means
+    'interaction_features': ['cooling_load', 'people_density', 'occupancy_ratio'],  # Interaction features mới
+    'dynamic_features': ['active_occupants'],  # Dynamic occupants
     'target': 'electricity_consumption'
 }
 

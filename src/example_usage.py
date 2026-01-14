@@ -34,10 +34,11 @@ json_data = {
     'dewTemperature': -2.2,
     'windSpeed': 2.6,
     'seaLvlPressure': 1020.7,
-    'precipDepth1HR': 0.0
+    'precipDepth1HR': 0.0,
 }
 
-result = inference.predict_from_json(json_data)
+result = inference.predict_from_json(json_data) ## Predict : 12h -> output: 98.25 kWh
+
 print(json.dumps(result, indent=2))
 
 # Example 2: Predict with threshold

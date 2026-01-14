@@ -224,17 +224,26 @@ class DiceExplainer:
                 'description': 'Air temperature (weather data - cannot control)'
             },
             'dewTemperature': {
-                'adjustable': False,
+                'adjustable': True,
+                'direction': 'decrease',
+                'min_change_pct': 0.10,
+                'max_change_pct': 0.50,
                 'description': 'Dew temperature (weather data - cannot control)'
             },
             'windSpeed': {
-                'adjustable': False,
-                'description': 'Wind speed (weather data - cannot control)'
+                'adjustable': True,
+                'direction': 'decrease',
+                'min_change_pct': 0.10,
+                'max_change_pct': 0.50,
+                'description': 'Wind speed (weather data - can reduce usage)'
             },
             # Building features - FIXED (cannot change building properties)
             'sqm': {
-                'adjustable': False,
-                'description': 'Building area (square meters) - FIXED'
+                'adjustable': True,
+                'direction': 'decrease',  # Can only decrease (reduce space)
+                'min_change_pct': 0.05,  # Minimum 5% change
+                'max_change_pct': 0.30,  # Maximum 30% change
+                'description': 'Building area (square meters)'
             },
             'primaryspaceusage': {
                 'adjustable': False,
@@ -249,13 +258,6 @@ class DiceExplainer:
                 'description': 'Building ID (fixed)'
             },
             # Energy consumption features - ADJUSTABLE (can control usage)
-            # 'numberoffloors': {
-            #     'adjustable': True,
-            #     'direction': 'decrease',
-            #     'min_change_pct': 0.10,
-            #     'max_change_pct': 0.50,
-            #     'description': 'Number of floors (can reduce usage)'
-            # },
             'Chilledwater': {
                 'adjustable': True,
                 'direction': 'decrease',
@@ -269,7 +271,15 @@ class DiceExplainer:
                 'min_change_pct': 0.10,
                 'max_change_pct': 0.50,
                 'description': 'Hot water consumption (can reduce usage)'
-            }
+            },
+            # Note: numberoffloors is not in current feature set, but marked as actionable for future use
+            # 'numberoffloors': {
+            #     'adjustable': True,
+            #     'direction': 'decrease',
+            #     'min_change_pct': 0.0,
+            #     'max_change_pct': 0.30,
+            #     'description': 'Number of floors (can reduce usage by reducing active floors)'
+            # }
         }
     
     def _setup_dice(self):
@@ -604,6 +614,22 @@ class DiceExplainer:
                 if feat in ['Chilledwater', 'Hotwater']:
                     min_val = max(0.0, min_val)
                 
+                # For weather features that can be negative, ensure reasonable bounds
+                # (dewTemperature can be negative, windSpeed should be non-negative)
+                if feat == 'windSpeed':
+                    min_val = max(0.0, min_val)  # Wind speed can't be negative
+                elif feat == 'sqm':
+                    min_val = max(100, min_val)  # Minimum 100 sqm
+                elif feat == 'dewTemperature':
+                    # Dew temperature can be negative, but set a reasonable lower bound
+                    # Allow it to go down but not too extreme (e.g., not below -50°C)
+                    min_val = max(-50.0, min_val)
+                
+                # For numberoffloors, ensure it's at least 1
+                # if feat == 'numberoffloors':
+                #     min_val = max(1.0, min_val)
+                #     max_val = max(1.0, max_val)  # Ensure max is also at least 1
+                
                 permitted_range[feat] = (float(min_val), float(max_val))
         
         return permitted_range
@@ -695,7 +721,8 @@ class DiceExplainer:
             cf_params = {
                 'query_instances': query_instance_for_dice,
                 'total_CFs': total_cfs * 2,  # Generate more to have better chance
-                'desired_range': [desired_range_min, desired_range_max]
+                'desired_range': [desired_range_min, desired_range_max],
+                'features_to_vary': actionable_features_list  # Only vary actionable features
             }
             
             if permitted_range:
@@ -711,10 +738,35 @@ class DiceExplainer:
             print(f"   🔍 Generating counterfactuals with method='{method}'...")
             
             # Generate counterfactuals
+            counterfactuals = None
             try:
                 counterfactuals = self.explainer.generate_counterfactuals(**cf_params)
             except Exception as e:
-                if method == 'genetic':
+                error_msg = str(e)
+                # If features_to_vary is too restrictive, try without it but filter results later
+                if 'No counterfactuals found' in error_msg or 'features_to_vary' in error_msg.lower():
+                    print(f"   ⚠️  Could not find counterfactuals with restricted features. Trying without restriction...")
+                    # Remove features_to_vary and try again
+                    cf_params_no_restrict = cf_params.copy()
+                    cf_params_no_restrict.pop('features_to_vary', None)
+                    try:
+                        counterfactuals = self.explainer.generate_counterfactuals(**cf_params_no_restrict)
+                        print(f"   ✅ Found counterfactuals without feature restriction (will filter to actionable only)")
+                    except Exception as e2:
+                        if method == 'genetic':
+                            print(f"   ⚠️  Genetic method failed: {e2}")
+                            print(f"   🔄 Falling back to 'random' method...")
+                            self.explainer = Dice(
+                                self.dice_data,
+                                self.dice_model,
+                                method='random'
+                            )
+                            cf_params_no_restrict = cf_params.copy()
+                            cf_params_no_restrict.pop('features_to_vary', None)
+                            counterfactuals = self.explainer.generate_counterfactuals(**cf_params_no_restrict)
+                        else:
+                            raise
+                elif method == 'genetic':
                     print(f"   ⚠️  Genetic method failed: {e}")
                     print(f"   🔄 Falling back to 'random' method...")
                     self.explainer = Dice(
@@ -754,6 +806,14 @@ class DiceExplainer:
                 # Convert counterfactual back to encoded format for prediction
                 cf_dict = row.to_dict()
                 
+                # IMPORTANT: Restore non-actionable features to original values
+                # This ensures DiCE doesn't change features we can't control
+                actionable_set = set(actionable_features_list)
+                for col in self.feature_cols:
+                    if col not in actionable_set and col in query_instance_for_dice.columns:
+                        # Restore original value for non-actionable features
+                        cf_dict[col] = query_instance_for_dice[col].iloc[0]
+                
                 # Encode categorical features
                 cf_encoded = pd.DataFrame([cf_dict])
                 for col in self.categorical_cols:
@@ -769,9 +829,15 @@ class DiceExplainer:
                 # Predict with counterfactual (using hour 1 model by default)
                 cf_prediction = self.forecaster.models[1].predict(cf_encoded[self.feature_cols].values)[0]
                 
-                # Calculate changes
+                # Calculate changes - ONLY include actionable features
                 changes = []
+                # actionable_set already defined above
+                
                 for col in self.feature_cols:
+                    # Only process actionable features
+                    if col not in actionable_set:
+                        continue
+                    
                     if col in query_instance_for_dice.columns and col in cf_dict:
                         original_val = query_instance_for_dice[col].iloc[0]
                         cf_val = cf_dict[col]
@@ -980,10 +1046,12 @@ class DiceExplainer:
             print(f"   📋 Actionable features: {actionable_features_list}")
             
             # Prepare parameters
+            # Try with features_to_vary first, but if it fails, try without it
             cf_params = {
                 'query_instances': query_instance_for_dice,
                 'total_CFs': total_cfs * 2,
-                'desired_range': [desired_range_min, desired_range_max]
+                'desired_range': [desired_range_min, desired_range_max],
+                'features_to_vary': actionable_features_list  # Only vary actionable features
             }
             
             if permitted_range:
@@ -999,10 +1067,31 @@ class DiceExplainer:
             print(f"   🔍 Generating counterfactuals with method='{method}'...")
             
             # Generate counterfactuals
+            counterfactuals = None
             try:
                 counterfactuals = explainer.generate_counterfactuals(**cf_params)
             except Exception as e:
-                if method == 'genetic':
+                error_msg = str(e)
+                # If features_to_vary is too restrictive, try without it but filter results later
+                if 'No counterfactuals found' in error_msg or 'features_to_vary' in error_msg.lower():
+                    print(f"   ⚠️  Could not find counterfactuals with restricted features. Trying without restriction...")
+                    # Remove features_to_vary and try again
+                    cf_params_no_restrict = cf_params.copy()
+                    cf_params_no_restrict.pop('features_to_vary', None)
+                    try:
+                        counterfactuals = explainer.generate_counterfactuals(**cf_params_no_restrict)
+                        print(f"   ✅ Found counterfactuals without feature restriction (will filter to actionable only)")
+                    except Exception as e2:
+                        if method == 'genetic':
+                            print(f"   ⚠️  Genetic method failed: {e2}")
+                            print(f"   🔄 Falling back to 'random' method...")
+                            explainer = self._get_dice_explainer_for_hour(hour_offset, 'random')
+                            cf_params_no_restrict = cf_params.copy()
+                            cf_params_no_restrict.pop('features_to_vary', None)
+                            counterfactuals = explainer.generate_counterfactuals(**cf_params_no_restrict)
+                        else:
+                            raise
+                elif method == 'genetic':
                     print(f"   ⚠️  Genetic method failed: {e}")
                     print(f"   🔄 Falling back to 'random' method...")
                     explainer = self._get_dice_explainer_for_hour(hour_offset, 'random')
@@ -1042,6 +1131,14 @@ class DiceExplainer:
                 # Convert counterfactual back to encoded format for prediction
                 cf_dict = row.to_dict()
                 
+                # IMPORTANT: Restore non-actionable features to original values
+                # This ensures DiCE doesn't change features we can't control
+                actionable_set = set(actionable_features_list)
+                for col in self.feature_cols:
+                    if col not in actionable_set and col in query_instance_for_dice.columns:
+                        # Restore original value for non-actionable features
+                        cf_dict[col] = query_instance_for_dice[col].iloc[0]
+                
                 # Encode categorical features
                 cf_encoded = pd.DataFrame([cf_dict])
                 for col in self.categorical_cols:
@@ -1057,9 +1154,15 @@ class DiceExplainer:
                 # Predict with counterfactual using the specific hour model
                 cf_prediction = self.forecaster.models[hour_offset].predict(cf_encoded[self.feature_cols].values)[0]
                 
-                # Calculate changes (same logic as generate_recommendations)
+                # Calculate changes - ONLY include actionable features
                 changes = []
+                # actionable_set already defined above
+                
                 for col in self.feature_cols:
+                    # Only process actionable features
+                    if col not in actionable_set:
+                        continue
+                    
                     if col in query_instance_for_dice.columns and col in cf_dict:
                         original_val = query_instance_for_dice[col].iloc[0]
                         cf_val = cf_dict[col]

@@ -62,7 +62,7 @@ default_input = {
     'Hotwater': 10306.8675,
 }
 
-def example1_full_recommendations(explainer, default_input, threshold):
+def example1_full_recommendations(explainer: DiceExplainer, default_input: dict, threshold: float):
     print("=" * 80)
     print("EXAMPLE 1: Full Recommendations (t+1)")
     print("=" * 80)
@@ -105,7 +105,7 @@ def example1_full_recommendations(explainer, default_input, threshold):
     else:
         print(f"✅ Consumption is already below threshold!")
 
-def example2_simplified_recommendations(explainer, default_input, threshold):
+def example2_simplified_recommendations(explainer: DiceExplainer, default_input: dict, threshold: float):
     print("\n" + "=" * 80)
     print("EXAMPLE 2: Simplified Recommendations")
     print("=" * 80)
@@ -133,7 +133,7 @@ def example2_simplified_recommendations(explainer, default_input, threshold):
         import traceback
         traceback.print_exc()
 
-def example3_specific_hour_recommendations(explainer, default_input, threshold, hour_offset=5):
+def example3_specific_hour_recommendations(explainer: DiceExplainer, default_input: dict, threshold: float, hour_offset: int = 5):
     print("\n" + "=" * 80)
     print(f"EXAMPLE 3: Recommendations for Specific Hour (t+{hour_offset})")
     print("=" * 80)
@@ -167,7 +167,7 @@ def example3_specific_hour_recommendations(explainer, default_input, threshold, 
         import traceback
         traceback.print_exc()
 
-def example4_monitor_24_hours(explainer, default_input, threshold):
+def example4_monitor_24_hours(explainer: DiceExplainer, default_input: dict, threshold: float):
     print("\n" + "=" * 80)
     print("EXAMPLE 4: Monitor All 24 Hours")
     print("=" * 80)

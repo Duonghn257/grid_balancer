@@ -77,6 +77,7 @@ def example1_full_recommendations(explainer: DiceExplainer, default_input: dict,
             recommendations = explainer.generate_recommendations(
                 json_data=default_input,
                 threshold=threshold,
+                hour_offset=3,
                 total_cfs=5,
                 method='random'
             )

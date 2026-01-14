@@ -187,8 +187,8 @@ class DiceExplainer:
         
         # Initialize DiCE components
         self.dice_data = None
-        self.dice_model = None
-        self.explainer = None
+        self.dice_models = {}  # Dictionary of 24 dice models, one for each hour
+        self.explainer = None  # Default explainer for hour 1 (for backward compatibility)
         
         # Load and setup DiCE
         self._setup_dice()
@@ -411,29 +411,29 @@ class DiceExplainer:
                 outcome_name=target_col
             )
         
-        # Create wrapper model for DiCE (default to hour 1)
-        # We'll create hour-specific wrappers on demand
-        self.default_wrapped_model = MultiHorizonModelWrapper(self.forecaster, hour_offset=1)
+        # Create 24 DiCE models (one for each hour)
+        print("   Creating DiCE models for all 24 hours...")
+        for hour in range(1, self.horizon + 1):
+            wrapped_model = MultiHorizonModelWrapper(self.forecaster, hour_offset=hour)
+            dice_model = dice_ml.Model(
+                model=wrapped_model,
+                backend='sklearn',
+                model_type='regressor'
+            )
+            self.dice_models[hour] = dice_model
         
-        # Create DiCE Model object (default for hour 1)
-        self.dice_model = dice_ml.Model(
-            model=self.default_wrapped_model,
-            backend='sklearn',
-            model_type='regressor'
-        )
-        
-        # Create DiCE Explainer (default for hour 1)
+        # Create default explainer for hour 1 (for backward compatibility)
         self.explainer = Dice(
             self.dice_data,
-            self.dice_model,
+            self.dice_models[1],  # Use hour 1 model
             method='random'  # Default to 'random' for speed
         )
         
-        print("✅ DiCE setup complete!")
+        print(f"✅ DiCE setup complete! Created {len(self.dice_models)} models (one for each hour)")
     
     def _get_dice_explainer_for_hour(self, hour_offset: int, method: str = 'random'):
         """
-        Get or create a DiCE explainer for a specific hour.
+        Get or create a DiCE explainer for a specific hour using pre-created dice model.
         
         Args:
             hour_offset: Hour offset (1-24)
@@ -445,17 +445,10 @@ class DiceExplainer:
         if hour_offset < 1 or hour_offset > self.horizon:
             raise ValueError(f"hour_offset must be between 1 and {self.horizon}, got {hour_offset}")
         
-        # Create wrapper for this specific hour
-        wrapped_model = MultiHorizonModelWrapper(self.forecaster, hour_offset=hour_offset)
+        # Use pre-created dice model for this hour
+        dice_model = self.dice_models[hour_offset]
         
-        # Create DiCE Model object
-        dice_model = dice_ml.Model(
-            model=wrapped_model,
-            backend='sklearn',
-            model_type='regressor'
-        )
-        
-        # Create DiCE Explainer
+        # Create DiCE Explainer with the pre-created model
         explainer = Dice(
             self.dice_data,
             dice_model,
@@ -637,6 +630,7 @@ class DiceExplainer:
     def generate_recommendations(self,
                                 json_data: Dict,
                                 threshold: float,
+                                hour_offset: int = 1,
                                 total_cfs: int = 5,
                                 method: str = 'random') -> Dict:
         """
@@ -644,25 +638,31 @@ class DiceExplainer:
         
         Args:
             json_data: Dictionary with building and weather data
-            threshold: Target consumption threshold (kWh) for first hour (t+1)
+            threshold: Target consumption threshold (kWh) for the specified hour
+            hour_offset: Hours ahead to predict (1-24, where 1 = next hour, default 1 for backward compatibility)
             total_cfs: Number of counterfactual examples to generate
             method: DiCE method ('random' or 'genetic')
             
         Returns:
-            Dictionary with recommendations and counterfactuals
+            Dictionary with recommendations and counterfactuals for the specified hour
         """
-        # First, predict current consumption (first hour)
-        result = self.forecaster(json_data)
-        current_prediction = result[0]['electric']  # First hour prediction
+        if hour_offset < 1 or hour_offset > self.horizon:
+            raise ValueError(f"hour_offset must be between 1 and {self.horizon}, got {hour_offset}")
+        
+        # Predict current consumption for the specified hour
+        current_prediction_result = self.forecaster.predict_hour(json_data, hour_offset)
+        current_prediction = current_prediction_result['electric']
         
         # Check if already below threshold
         if current_prediction <= threshold:
             return {
                 'success': True,
+                'hour_offset': hour_offset,
+                'time': current_prediction_result['time'],
                 'current_prediction': float(current_prediction),
                 'threshold': float(threshold),
                 'below_threshold': True,
-                'message': f'Current consumption ({current_prediction:.2f} kWh) is already below threshold ({threshold} kWh)',
+                'message': f'Current consumption for hour t+{hour_offset} ({current_prediction:.2f} kWh) is already below threshold ({threshold} kWh)',
                 'recommendations': []
             }
         
@@ -670,8 +670,8 @@ class DiceExplainer:
         X, start_time = preprocess(json_data)
         X_encoded = self.forecaster.encoder.transform(X)
         
-        # Prepare query instance for DiCE
-        query_instance = self._prepare_query_instance(json_data, X_encoded)
+        # Prepare query instance for DiCE (for the specified hour)
+        query_instance = self._prepare_query_instance_for_hour(json_data, X_encoded, hour_offset)
         
         # Get permitted ranges for actionable features
         permitted_range = self._get_permitted_ranges(query_instance, json_data)
@@ -685,6 +685,8 @@ class DiceExplainer:
         if not actionable_features_list:
             return {
                 'success': False,
+                'hour_offset': hour_offset,
+                'time': current_prediction_result['time'],
                 'error': 'No actionable features available. Cannot generate counterfactuals.',
                 'current_prediction': float(current_prediction),
                 'threshold': float(threshold),
@@ -692,22 +694,20 @@ class DiceExplainer:
             }
         
         # Remove target column from query instance (DiCE doesn't want it)
-        query_instance_for_dice = query_instance.drop(columns=['target_t+1'], errors='ignore')
+        target_col = f'target_t+{hour_offset}'
+        query_instance_for_dice = query_instance.drop(columns=[target_col], errors='ignore')
+        
+        # Get DiCE explainer for the specified hour
+        explainer = self._get_dice_explainer_for_hour(hour_offset, method)
         
         # Generate counterfactuals
         try:
-            # Update explainer method if needed
-            if method != 'random':
-                self.explainer = Dice(
-                    self.dice_data,
-                    self.dice_model,
-                    method=method
-                )
             
             # Desired range for counterfactuals
             desired_range_min = max(0.0, threshold * 0.85)
             desired_range_max = threshold
             
+            print(f"   📋 Generating recommendations for hour t+{hour_offset} ({current_prediction_result['time']})")
             print(f"   📋 Actionable features: {actionable_features_list}")
             if permitted_range:
                 print(f"   📋 Permitted ranges: {list(permitted_range.keys())}")
@@ -740,7 +740,7 @@ class DiceExplainer:
             # Generate counterfactuals
             counterfactuals = None
             try:
-                counterfactuals = self.explainer.generate_counterfactuals(**cf_params)
+                counterfactuals = explainer.generate_counterfactuals(**cf_params)
             except Exception as e:
                 error_msg = str(e)
                 # If features_to_vary is too restrictive, try without it but filter results later
@@ -750,31 +750,23 @@ class DiceExplainer:
                     cf_params_no_restrict = cf_params.copy()
                     cf_params_no_restrict.pop('features_to_vary', None)
                     try:
-                        counterfactuals = self.explainer.generate_counterfactuals(**cf_params_no_restrict)
+                        counterfactuals = explainer.generate_counterfactuals(**cf_params_no_restrict)
                         print(f"   ✅ Found counterfactuals without feature restriction (will filter to actionable only)")
                     except Exception as e2:
                         if method == 'genetic':
                             print(f"   ⚠️  Genetic method failed: {e2}")
                             print(f"   🔄 Falling back to 'random' method...")
-                            self.explainer = Dice(
-                                self.dice_data,
-                                self.dice_model,
-                                method='random'
-                            )
+                            explainer = self._get_dice_explainer_for_hour(hour_offset, 'random')
                             cf_params_no_restrict = cf_params.copy()
                             cf_params_no_restrict.pop('features_to_vary', None)
-                            counterfactuals = self.explainer.generate_counterfactuals(**cf_params_no_restrict)
+                            counterfactuals = explainer.generate_counterfactuals(**cf_params_no_restrict)
                         else:
                             raise
                 elif method == 'genetic':
                     print(f"   ⚠️  Genetic method failed: {e}")
                     print(f"   🔄 Falling back to 'random' method...")
-                    self.explainer = Dice(
-                        self.dice_data,
-                        self.dice_model,
-                        method='random'
-                    )
-                    counterfactuals = self.explainer.generate_counterfactuals(**cf_params)
+                    explainer = self._get_dice_explainer_for_hour(hour_offset, 'random')
+                    counterfactuals = explainer.generate_counterfactuals(**cf_params)
                 else:
                     raise
             
@@ -782,6 +774,8 @@ class DiceExplainer:
             if not hasattr(counterfactuals, 'cf_examples_list') or not counterfactuals.cf_examples_list:
                 return {
                     'success': False,
+                    'hour_offset': hour_offset,
+                    'time': current_prediction_result['time'],
                     'error': 'No counterfactuals generated by DiCE',
                     'current_prediction': float(current_prediction),
                     'threshold': float(threshold),
@@ -792,6 +786,8 @@ class DiceExplainer:
             if not hasattr(cf_example, 'final_cfs_df'):
                 return {
                     'success': False,
+                    'hour_offset': hour_offset,
+                    'time': current_prediction_result['time'],
                     'error': 'Counterfactual example has no final_cfs_df attribute',
                     'current_prediction': float(current_prediction),
                     'threshold': float(threshold),
@@ -826,8 +822,8 @@ class DiceExplainer:
                         )
                         cf_encoded[col] = le.transform(values)
                 
-                # Predict with counterfactual (using hour 1 model by default)
-                cf_prediction = self.forecaster.models[1].predict(cf_encoded[self.feature_cols].values)[0]
+                # Predict with counterfactual using the specified hour model
+                cf_prediction = self.forecaster.models[hour_offset].predict(cf_encoded[self.feature_cols].values)[0]
                 
                 # Calculate changes - ONLY include actionable features
                 changes = []
@@ -892,6 +888,8 @@ class DiceExplainer:
             
             return {
                 'success': True,
+                'hour_offset': hour_offset,
+                'time': current_prediction_result['time'],
                 'current_prediction': float(current_prediction),
                 'threshold': float(threshold),
                 'below_threshold': False,
@@ -904,6 +902,8 @@ class DiceExplainer:
             import traceback
             return {
                 'success': False,
+                'hour_offset': hour_offset,
+                'time': current_prediction_result.get('time', ''),
                 'error': str(e),
                 'error_details': traceback.format_exc(),
                 'current_prediction': float(current_prediction),
